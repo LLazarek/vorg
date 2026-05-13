@@ -176,6 +176,18 @@ def image_path_from_org_link(raw):
     return {"path": path, "alt": display or Path(path).name, "raw": raw.strip()}
 
 
+def pdf_path_from_org_link(raw):
+    match = ORG_LINK_RE.match(raw.strip())
+    if not match:
+        return None
+    target = match.group(1)
+    display = match.group(2) or ""
+    path = target.removeprefix("file:")
+    if Path(path).suffix.lower() != ".pdf":
+        return None
+    return {"path": path, "title": display or Path(path).name, "raw": raw.strip()}
+
+
 def sql_identifier(name):
     return '"' + str(name).replace('"', '""') + '"'
 
@@ -339,17 +351,21 @@ def parse_block_content(lines, start_line, end_line, drawer, heading_id):
             line_index += 1
             continue
         begin_src = parse_begin_src(stripped)
-        if begin_src and begin_src["language"] in ("sql", "sqlite"):
+        if begin_src:
             flush_text()
+            language = begin_src["language"]
             line_index += 1
-            sql_lines = []
+            src_lines = []
             while line_index < end_line and not END_SRC_RE.match(line_body(lines[line_index]).strip()):
-                sql_lines.append(line_body(lines[line_index]))
+                src_lines.append(line_body(lines[line_index]))
                 line_index += 1
             if line_index < end_line:
                 line_index += 1
-            if pending_name:
-                named_queries[pending_name] = "\n".join(sql_lines).strip()
+            if language in ("sql", "sqlite"):
+                if pending_name:
+                    named_queries[pending_name] = "\n".join(src_lines).strip()
+            else:
+                content.append({"kind": "srcBlock", "language": language, "body": "\n".join(src_lines)})
             pending_name = None
             pending_view = None
             continue
@@ -383,6 +399,14 @@ def parse_block_content(lines, start_line, end_line, drawer, heading_id):
         if image:
             flush_text()
             content.append({"kind": "image", **image})
+            pending_name = None
+            pending_view = None
+            line_index += 1
+            continue
+        pdf = pdf_path_from_org_link(stripped)
+        if pdf:
+            flush_text()
+            content.append({"kind": "pdf", **pdf})
             pending_name = None
             pending_view = None
             line_index += 1
@@ -431,13 +455,13 @@ def update_component_directive(text, block_id, component_id, component_type, att
         if properties.get("ID") != block_id:
             continue
 
-        next_heading_line = headings[index + 1]["headingLine"] if index + 1 < len(headings) else len(lines)
         body_start = heading["headingLine"] + 1
         if drawer:
             body_start = max(body_start, drawer["endLine"] + 1)
+        end_line = block_end_line(headings, index, lines)
 
         component_index = 0
-        for line_no in range(body_start, next_heading_line):
+        for line_no in range(body_start, end_line):
             raw = line_body(lines[line_no]).strip()
             if not COMPONENT_RE.match(raw):
                 continue
@@ -460,12 +484,12 @@ def insert_component_directive(text, block_id, component_type, attrs):
         if properties.get("ID") != block_id:
             continue
 
-        next_heading_line = headings[index + 1]["headingLine"] if index + 1 < len(headings) else len(lines)
+        end_line = block_end_line(headings, index, lines)
         insertion = []
-        if next_heading_line > 0 and line_body(lines[next_heading_line - 1]).strip():
+        if end_line > 0 and line_body(lines[end_line - 1]).strip():
             insertion.append(newline)
         insertion.append(serialize_component_directive(component_type, attrs) + newline)
-        lines[next_heading_line:next_heading_line] = insertion
+        lines[end_line:end_line] = insertion
         return "".join(lines)
 
     raise ValueError("Block not found.")
@@ -480,13 +504,13 @@ def delete_component_directive(text, block_id, component_id):
         if properties.get("ID") != block_id:
             continue
 
-        next_heading_line = headings[index + 1]["headingLine"] if index + 1 < len(headings) else len(lines)
         body_start = heading["headingLine"] + 1
         if drawer:
             body_start = max(body_start, drawer["endLine"] + 1)
+        end_line = block_end_line(headings, index, lines)
 
         component_index = 0
-        for line_no in range(body_start, next_heading_line):
+        for line_no in range(body_start, end_line):
             raw = line_body(lines[line_no]).strip()
             if not COMPONENT_RE.match(raw):
                 continue
@@ -503,7 +527,7 @@ def text_segments(lines, start_line, end_line):
     segments = []
     segment_start = None
     segment_end = None
-    in_sql_block = False
+    in_src_block = False
 
     def flush():
         nonlocal segment_start, segment_end
@@ -518,13 +542,13 @@ def text_segments(lines, start_line, end_line):
     for line_no in range(start_line, end_line):
         stripped = line_body(lines[line_no]).strip()
         begin_src = parse_begin_src(stripped)
-        if begin_src and begin_src["language"] in ("sql", "sqlite"):
-            in_sql_block = True
+        if begin_src:
+            in_src_block = True
             flush()
             continue
-        if in_sql_block:
+        if in_src_block:
             if END_SRC_RE.match(stripped):
-                in_sql_block = False
+                in_src_block = False
             flush()
             continue
         if stripped.startswith("#+") or is_org_table_line(stripped) or image_path_from_org_link(stripped):
@@ -549,12 +573,12 @@ def update_block_text(text, block_id, text_index, body):
         if properties.get("ID") != block_id:
             continue
 
-        next_heading_line = headings[index + 1]["headingLine"] if index + 1 < len(headings) else len(lines)
         body_start = heading["headingLine"] + 1
         if drawer:
             body_start = max(body_start, drawer["endLine"] + 1)
+        end_line = block_end_line(headings, index, lines)
 
-        segments = text_segments(lines, body_start, next_heading_line)
+        segments = text_segments(lines, body_start, end_line)
         if text_index < 0 or text_index >= len(segments):
             raise ValueError("Text chunk not found.")
 
@@ -564,6 +588,15 @@ def update_block_text(text, block_id, text_index, body):
         return "".join(lines)
 
     raise ValueError("Block not found.")
+
+
+def block_end_line(headings, index, lines):
+    end = headings[index + 1]["headingLine"] if index + 1 < len(headings) else len(lines)
+    j = index + 1
+    while j < len(headings) and headings[j]["level"] > headings[index]["level"] and "merge" in headings[j]["tags"]:
+        end = headings[j + 1]["headingLine"] if j + 1 < len(headings) else len(lines)
+        j += 1
+    return end
 
 
 def parse_heading_tags(raw_title):
@@ -592,14 +625,20 @@ def find_headings(text):
     return lines, headings
 
 
+
 def ensure_heading_ids(text):
     lines, headings = find_headings(text)
     newline = detect_newline(text)
     edits = []
     changed = False
 
+    novizall_level = None
     for heading in headings:
-        if "noviz" in heading["tags"]:
+        if novizall_level is not None and heading["level"] <= novizall_level:
+            novizall_level = None
+        if novizall_level is not None or "noviz" in heading["tags"] or "novizall" in heading["tags"] or "merge" in heading["tags"]:
+            if "novizall" in heading["tags"]:
+                novizall_level = heading["level"]
             continue
         drawer = heading["propertyDrawer"]
         properties = drawer["properties"] if drawer else {}
@@ -629,8 +668,7 @@ def parse_org_document(text, workspace_doc=None, project_root=None):
     diagnostics = []
 
     for index, heading in enumerate(headings):
-        next_heading_line = headings[index + 1]["headingLine"] if index + 1 < len(headings) else len(lines)
-        heading["contentEndLine"] = next_heading_line
+        heading["contentEndLine"] = headings[index + 1]["headingLine"] if index + 1 < len(headings) else len(lines)
 
     for index, heading in enumerate(headings):
         heading["key"] = f"h-{index + 1}"
@@ -663,10 +701,17 @@ def parse_org_document(text, workspace_doc=None, project_root=None):
     named_queries = dict(workspace_doc.get("sqlSources", {}))
     nodes = workspace_doc.get("nodes", {})
     previous_block_id = None
+    novizall_level = None
     for index, heading in enumerate(headings):
         heading_id = heading["id"]
 
-        if "noviz" in heading["tags"]:
+        if novizall_level is not None and heading["level"] <= novizall_level:
+            novizall_level = None
+        suppressed = novizall_level is not None or "noviz" in heading["tags"] or "novizall" in heading["tags"]
+        if "novizall" in heading["tags"]:
+            novizall_level = heading["level"]
+
+        if suppressed:
             _, _, block_named_tables, block_named_queries = parse_block_content(
                 lines,
                 heading["headingLine"],
@@ -678,15 +723,20 @@ def parse_org_document(text, workspace_doc=None, project_root=None):
             named_queries.update(block_named_queries)
             continue
 
+        if "merge" in heading["tags"]:
+            continue
+
         if not heading_id:
             heading["diagnostics"].append("Missing ID.")
         elif id_counts[heading_id] > 1:
             heading["diagnostics"].append(f"Duplicate ID: {heading_id}")
 
+        end_line = block_end_line(headings, index, lines)
+
         components, content, block_named_tables, block_named_queries = parse_block_content(
             lines,
             heading["headingLine"],
-            heading["contentEndLine"],
+            end_line,
             heading["propertyDrawer"],
             heading_id or heading["key"],
         )
