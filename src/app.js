@@ -31,6 +31,7 @@ const elements = {
   historyList: document.getElementById("history-list"),
   pendingSnapshots: document.getElementById("pending-snapshots"),
   pendingStatus: document.getElementById("pending-status"),
+  extensionStatus: document.getElementById("extension-status"),
   sourcePanel: document.querySelector(".source-panel"),
   inspectorPanel: document.querySelector(".inspector-panel"),
   workspace: document.querySelector(".workspace"),
@@ -58,7 +59,8 @@ const state = {
   history: [],
   sourceDirty: false,
   sourceCollapsed: false,
-  inspectorCollapsed: false
+  inspectorCollapsed: false,
+  extensionConnected: false
 };
 const dataCache = new Map();
 const bodySaveTimers = new Map();
@@ -66,9 +68,6 @@ const blockResizeObserver = new ResizeObserver(() => {
   applyFlowLayout();
   drawEdges();
 });
-// Set this to the installed extension's ID (found in chrome://extensions after loading the extension).
-const EXTENSION_ID = null;
-
 const COMPONENT_SCHEMAS = {
   board: ["source", "group", "title", "titleColumn", "columns", "sort", "color", "limit"],
   cards: ["source", "columns", "title", "limit"],
@@ -80,9 +79,9 @@ const COMPONENT_SCHEMAS = {
   log: ["source", "title", "limit"],
   pdf: ["path", "title", "page", "height"],
   table: ["source", "columns", "sort", "title", "limit"],
-  webSnapshot: ["id", "url", "title", "frozen_at"]
+  websnapshot: ["id", "url", "title", "frozen_at"]
 };
-const COMPONENT_TYPES = Object.keys(COMPONENT_SCHEMAS);
+const COMPONENT_TYPES = Object.keys(COMPONENT_SCHEMAS).filter((t) => t !== "websnapshot");
 
 function setStatus(element, text, variant = "") {
   element.textContent = text;
@@ -583,11 +582,19 @@ function componentTypeField(value) {
   return label;
 }
 
+const WEB_SNAPSHOT_READONLY = new Set(["id", "url", "title", "frozen_at"]);
+
 function renderInspectorFields(container, type, currentAttrs) {
   const attrs = normalizeAttrsForType(type, currentAttrs);
+  const isWebSnapshot = type === "websnapshot";
   container.replaceChildren();
   Object.entries(attrs).forEach(([key, value]) => {
-    container.append(inspectorField(key, value));
+    const field = inspectorField(key, value);
+    if (isWebSnapshot && WEB_SNAPSHOT_READONLY.has(key)) {
+      const input = field.querySelector("input");
+      if (input) input.readOnly = true;
+    }
+    container.append(field);
   });
 }
 
@@ -902,6 +909,7 @@ function syncInspectorPanel() {
   elements.inspectorPanel.classList.toggle("collapsed", state.inspectorCollapsed);
   elements.workspace.classList.toggle("inspector-collapsed", state.inspectorCollapsed);
   elements.toggleInspectorPanel.textContent = state.inspectorCollapsed ? "Expand" : "Collapse";
+  if (state.inspectorCollapsed) { stopPendingPoll(); } else { startPendingPoll(); }
 }
 
 function renderHistory() {
@@ -1224,7 +1232,7 @@ function renderComponent(component, block) {
     element = renderGalleryComponent(component);
   } else if (component.type === "pdf") {
     element = renderPdfComponent(component);
-  } else if (component.type === "webSnapshot") {
+  } else if (component.type === "websnapshot") {
     element = renderWebSnapshotComponent(component);
   } else {
     element = document.createElement("div");
@@ -1664,33 +1672,67 @@ function renderGalleryComponent(component) {
   return block;
 }
 
+function openSnapshotTab(snapshotId, url, title) {
+  if (!snapshotId) {
+    console.log("[orghtml] openSnapshotTab: no snapshotId, plain window.open");
+    window.open(url, "_blank", "noopener");
+    return;
+  }
+  const reqId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  let settled = false;
+  const onAck = (e) => {
+    if (e.source !== window || e.origin !== window.location.origin) return;
+    if (!e.data || e.data.type !== "orghtml-open-ack" || e.data.reqId !== reqId) return;
+    if (settled) return;
+    settled = true;
+    window.removeEventListener("message", onAck);
+    console.log("[orghtml] bridge ack:", e.data);
+  };
+  window.addEventListener("message", onAck);
+  console.log("[orghtml] posting orghtml-open via bridge", { reqId });
+  window.postMessage({ type: "orghtml-open", snapshotId, url, title, reqId }, window.location.origin);
+  setTimeout(() => {
+    window.removeEventListener("message", onAck);
+    if (settled) return;
+    settled = true;
+    console.warn("[orghtml] bridge timeout — falling back to window.open");
+    window.open(url, "_blank", "noopener");
+  }, 400);
+}
+
 function renderWebSnapshotComponent(component) {
   const attrs = component.attrs;
   const snapshotId = attrs.id || "";
   const url = attrs.url || "";
   const title = attrs.title || url || "Web Snapshot";
   const frozenAt = attrs.frozen_at || "";
-  const block = componentShell(title, component);
 
-  const meta = document.createElement("div");
-  meta.className = "web-snapshot-meta";
+  let frozenLabel = "";
+  if (frozenAt) {
+    try { frozenLabel = new Date(frozenAt).toLocaleString(); } catch { frozenLabel = frozenAt; }
+  }
+  const blockTitle = frozenLabel ? `${title} — ${frozenLabel}` : title;
+  const block = componentShell(blockTitle, component);
+
+  if (url) {
+    const openBtn = document.createElement("button");
+    openBtn.type = "button";
+    openBtn.className = "web-snapshot-open";
+    openBtn.textContent = "Open page";
+    openBtn.addEventListener("click", (event) => {
+      event.stopPropagation();
+      console.log("[orghtml] Open page clicked", {
+        snapshotId, url, extensionConnected: state.extensionConnected,
+      });
+      openSnapshotTab(snapshotId, url, title);
+    });
+    block.append(openBtn);
+  }
 
   const urlSpan = document.createElement("span");
   urlSpan.className = "web-snapshot-url";
   urlSpan.textContent = url;
-  meta.append(urlSpan);
-
-  if (frozenAt) {
-    const ts = document.createElement("span");
-    ts.className = "web-snapshot-ts";
-    try {
-      ts.textContent = new Date(frozenAt).toLocaleString();
-    } catch {
-      ts.textContent = frozenAt;
-    }
-    meta.append(ts);
-  }
-  block.append(meta);
+  block.append(urlSpan);
 
   if (snapshotId) {
     const imgPath = `.orghtml/snapshots/${encodeURIComponent(snapshotId)}.png`;
@@ -1709,28 +1751,7 @@ function renderWebSnapshotComponent(component) {
     block.append(img);
   }
 
-  block.addEventListener("click", (event) => {
-    event.stopPropagation();
-    if (!snapshotId || !url) return;
-    if (typeof chrome !== "undefined" && chrome.runtime && EXTENSION_ID) {
-      chrome.runtime.sendMessage(EXTENSION_ID, { type: "open", snapshotId, url }).catch(() => {
-        showExtensionHint(block);
-      });
-    } else {
-      showExtensionHint(block);
-    }
-  });
-
   return block;
-}
-
-function showExtensionHint(block) {
-  if (block.querySelector(".extension-hint")) return;
-  const hint = document.createElement("div");
-  hint.className = "extension-hint";
-  hint.textContent = "Install the OrgHTML browser extension to open snapshots.";
-  block.append(hint);
-  setTimeout(() => hint.remove(), 4000);
 }
 
 function renderPdfComponent(component) {
@@ -2351,9 +2372,9 @@ function deleteSelectedLinks() {
 let _pendingPollTimer = null;
 
 function renderPendingSnapshots(pending) {
-  if (\!elements.pendingSnapshots) return;
+  if (!elements.pendingSnapshots) return;
   elements.pendingSnapshots.replaceChildren();
-  if (\!pending.length) {
+  if (!pending.length) {
     setStatus(elements.pendingStatus, "—", "muted");
     const empty = document.createElement("div");
     empty.className = "pending-empty";
@@ -2389,14 +2410,14 @@ function renderPendingSnapshots(pending) {
     createBtn.type = "button";
     createBtn.textContent = "Create block";
     createBtn.addEventListener("click", async () => {
-      if (\!state.path) {
+      if (!state.path) {
         alert("Open a document first.");
         return;
       }
       createBtn.disabled = true;
       try {
-        const result = await apiPost("/api/snapshot/promote", { path: state.path, pendingId: entry.pendingId });
-        applyDocumentResult(result);
+        await apiPost("/api/snapshot/promote", { path: state.path, pendingId: entry.pendingId });
+        await loadDocument(state.path);
         setStatus(elements.workspaceStatus, "Block created from snapshot", "ok");
         refreshPendingSnapshots();
       } catch (error) {
@@ -2424,6 +2445,22 @@ function renderPendingSnapshots(pending) {
   });
 }
 
+async function refreshExtensionInfo() {
+  try {
+    const result = await apiGet("/api/snapshot/extension-info");
+    state.extensionConnected = result.connected || false;
+  } catch {
+    state.extensionConnected = false;
+  }
+  if (elements.extensionStatus) {
+    if (state.extensionConnected) {
+      setStatus(elements.extensionStatus, "ext: connected", "ok");
+    } else {
+      setStatus(elements.extensionStatus, "ext: disconnected", "error");
+    }
+  }
+}
+
 async function refreshPendingSnapshots() {
   try {
     const result = await apiGet("/api/snapshot/pending");
@@ -2435,8 +2472,12 @@ async function refreshPendingSnapshots() {
 
 function startPendingPoll() {
   if (_pendingPollTimer) return;
+  refreshExtensionInfo();
   refreshPendingSnapshots();
-  _pendingPollTimer = setInterval(refreshPendingSnapshots, 3000);
+  _pendingPollTimer = setInterval(() => {
+    refreshExtensionInfo();
+    refreshPendingSnapshots();
+  }, 3000);
 }
 
 function stopPendingPoll() {
@@ -2447,7 +2488,7 @@ function stopPendingPoll() {
 }
 
 function applyDocumentResult(result) {
-  if (\!result.parsed) return;
+  if (!result.parsed) return;
   state.blocks = result.parsed.blocks || [];
   state.links = result.parsed.links || [];
   state.namedSources = result.parsed.namedSources || {};
@@ -2552,6 +2593,7 @@ syncSourcePanel();
 syncInspectorPanel();
 const files = await refreshFiles();
 await refreshMetadata();
+await refreshExtensionInfo();
 const initialPath = files.includes("sample.org") ? "sample.org" : files[0];
 if (initialPath) {
   elements.fileSelect.value = initialPath;

@@ -12,6 +12,9 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
+import base64
+import threading
+from urllib.parse import urlparse as _urlparse_hostname
 
 
 HEADING_RE = re.compile(r"^(\*+)\s+(.*?)\s*$")
@@ -26,6 +29,64 @@ ORG_LINK_RE = re.compile(r"^\[\[([^\]\n]+?)(?:\]\[([^\]\n]*))?\]\]$")
 WORKSPACE_PATH = ".orghtml/workspace.json"
 HISTORY_PATH = ".orghtml/history.sqlite"
 IMAGE_EXTENSIONS = {".apng", ".avif", ".gif", ".jpeg", ".jpg", ".png", ".svg", ".webp"}
+
+SNAPSHOTS_DIR = ".orghtml/snapshots"
+
+_pending_lock = threading.Lock()
+_pending_snapshots = {}  # pendingId -> {url, title, captured_at, screenshot_bytes}
+
+_extension_lock = threading.Lock()
+_extension_id = None  # set by POST /api/snapshot/register-extension
+
+
+def register_extension(extension_id):
+    global _extension_id
+    with _extension_lock:
+        _extension_id = extension_id
+
+
+def get_extension_info():
+    with _extension_lock:
+        eid = _extension_id
+    return {"extensionId": eid, "connected": eid is not None}
+
+
+def enqueue_pending(url, title, png_bytes):
+    pending_id = str(uuid.uuid4())
+    with _pending_lock:
+        _pending_snapshots[pending_id] = {
+            "url": url,
+            "title": title,
+            "captured_at": datetime.now(timezone.utc).isoformat(),
+            "screenshot_bytes": png_bytes,
+        }
+    return pending_id
+
+
+def list_pending():
+    with _pending_lock:
+        return [
+            {
+                "pendingId": pid,
+                "url": entry["url"],
+                "title": entry["title"],
+                "captured_at": entry["captured_at"],
+            }
+            for pid, entry in _pending_snapshots.items()
+        ]
+
+
+def pop_pending(pending_id):
+    with _pending_lock:
+        entry = _pending_snapshots.pop(pending_id, None)
+    if entry is None:
+        raise ValueError(f"Pending snapshot not found: {pending_id}")
+    return entry
+
+
+def discard_pending(pending_id):
+    with _pending_lock:
+        _pending_snapshots.pop(pending_id, None)
 
 
 def detect_newline(text):
@@ -812,6 +873,121 @@ def parse_org_document(text, workspace_doc=None, project_root=None):
     }
 
 
+def find_component_by_snapshot_id(root, snapshot_id):
+    """Return (rel_path, block_id, component_id) for the webSnapshot directive matching snapshot_id, or None."""
+    for path in sorted(root.rglob("*.org")):
+        if ".orghtml" in path.parts or not path.is_file():
+            continue
+        rel_path = str(path.relative_to(root))
+        try:
+            content = path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        lines, headings = find_headings(content)
+        for index, heading in enumerate(headings):
+            drawer = heading["propertyDrawer"]
+            properties = drawer["properties"] if drawer else {}
+            block_id = properties.get("ID")
+            if not block_id:
+                continue
+            body_start = heading["headingLine"] + 1
+            if drawer:
+                body_start = max(body_start, drawer["endLine"] + 1)
+            end_line = block_end_line(headings, index, lines)
+            component_index = 0
+            for line_no in range(body_start, end_line):
+                raw = line_body(lines[line_no]).strip()
+                m = COMPONENT_RE.match(raw)
+                if not m:
+                    continue
+                component_id = f"{block_id}:component-{component_index + 1}"
+                component_index += 1
+                if m.group(1).lower() != "websnapshot":
+                    continue
+                attrs = parse_attrs(m.group(2))
+                if attrs.get("id") == snapshot_id:
+                    return rel_path, block_id, component_id
+    return None
+
+
+def parse_attrs(raw):
+    """Parse shell-style key=value attrs string into a dict."""
+    result = {}
+    try:
+        tokens = shlex.split(raw)
+    except ValueError:
+        tokens = raw.split()
+    for token in tokens:
+        if "=" in token:
+            key, _, value = token.partition("=")
+            result[key.strip()] = value.strip()
+    return result
+
+
+def snapshot_dir(root):
+    return root / SNAPSHOTS_DIR
+
+
+def write_snapshot_png(root, snapshot_id, png_bytes):
+    directory = snapshot_dir(root)
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / f"{snapshot_id}.png").write_bytes(png_bytes)
+
+
+def overwrite_snapshot_component(root, snapshot_id, url, title, frozen_at, png_bytes):
+    result = find_component_by_snapshot_id(root, snapshot_id)
+    if result is None:
+        raise ValueError(f"webSnapshot component with id={snapshot_id} not found.")
+    rel_path, block_id, component_id = result
+    target = root / rel_path
+    text = target.read_text(encoding="utf-8")
+    snapshot_path_state(root, rel_path, "snapshot-overwrite")
+    write_snapshot_png(root, snapshot_id, png_bytes)
+    new_attrs = {"id": snapshot_id, "url": url, "title": title, "frozen_at": frozen_at}
+    updated = update_component_directive(text, block_id, component_id, "webSnapshot", new_attrs)
+    target.write_text(updated, encoding="utf-8")
+    _, doc_workspace = document_workspace(root, rel_path)
+    return rel_path, parse_org_document(updated, doc_workspace, root)
+
+
+def promote_pending_snapshot(root, rel_path, pending_id, heading_title=None):
+    entry = pop_pending(pending_id)
+    snapshot_id = str(uuid.uuid4())
+    block_id = str(uuid.uuid4())
+    frozen_at = entry["captured_at"]
+    url = entry["url"]
+    title = entry["title"]
+    if not heading_title:
+        try:
+            hostname = _urlparse_hostname(url).hostname or url
+        except Exception:
+            hostname = url
+        heading_title = f"Web snapshot — {hostname}"
+
+    snapshot_path_state(root, rel_path, "snapshot-promote")
+    write_snapshot_png(root, snapshot_id, entry["screenshot_bytes"])
+
+    target = root / rel_path
+    text = target.read_text(encoding="utf-8")
+    newline = detect_newline(text)
+    attrs = {"id": snapshot_id, "url": url, "title": title, "frozen_at": frozen_at}
+    directive = serialize_component_directive("webSnapshot", attrs)
+    block_heading = (
+        f"{newline}* {heading_title}{newline}"
+        f":PROPERTIES:{newline}"
+        f":ID: {block_id}{newline}"
+        f":END:{newline}"
+        f"{directive}{newline}"
+    )
+    if not text.endswith(newline):
+        block_heading = newline + block_heading
+    updated = text + block_heading
+    target.write_text(updated, encoding="utf-8")
+    _, doc_workspace = document_workspace(root, rel_path)
+    parsed = parse_org_document(updated, doc_workspace, root)
+    return rel_path, updated, parsed
+
+
 def workspace_file(root):
     return root / WORKSPACE_PATH
 
@@ -1303,6 +1479,10 @@ class OrgHtmlHandler(BaseHTTPRequestHandler):
             return self.handle_history(parsed.query)
         if parsed.path == "/api/recipe/generate":
             return self.write_json(generate_recipe(self.server.project_root))
+        if parsed.path == "/api/snapshot/pending":
+            return self.handle_snapshot_pending()
+        if parsed.path == "/api/snapshot/extension-info":
+            return self.write_json(get_extension_info())
         if parsed.path == "/asset":
             return self.handle_asset(parsed.query)
         return self.serve_static(parsed.path)
@@ -1331,6 +1511,14 @@ class OrgHtmlHandler(BaseHTTPRequestHandler):
             return self.handle_history_restore()
         if parsed.path == "/api/recipe/apply":
             return self.handle_recipe_apply()
+        if parsed.path == "/api/snapshot/freeze":
+            return self.handle_snapshot_freeze()
+        if parsed.path == "/api/snapshot/promote":
+            return self.handle_snapshot_promote()
+        if parsed.path == "/api/snapshot/discard":
+            return self.handle_snapshot_discard()
+        if parsed.path == "/api/snapshot/register-extension":
+            return self.handle_register_extension()
         self.send_error(404)
 
     def handle_files(self):
@@ -1656,6 +1844,70 @@ class OrgHtmlHandler(BaseHTTPRequestHandler):
             self.send_error(400, "Recipe blocks must be a list.")
             return
         return self.write_json(apply_recipe(self.server.project_root, recipe))
+
+    def handle_snapshot_pending(self):
+        return self.write_json({"pending": list_pending()})
+
+    def handle_snapshot_freeze(self):
+        payload = self.read_json()
+        url = payload.get("url", "")
+        title = payload.get("title", "")
+        screenshot_b64 = payload.get("screenshot", "")
+        try:
+            png_bytes = base64.b64decode(screenshot_b64)
+        except Exception:
+            self.send_error(400, "Invalid screenshot base64.")
+            return
+        snapshot_id = payload.get("snapshotId")
+        if snapshot_id:
+            frozen_at = datetime.now(timezone.utc).isoformat()
+            try:
+                rel_path, parsed = overwrite_snapshot_component(
+                    self.server.project_root, snapshot_id, url, title, frozen_at, png_bytes
+                )
+            except ValueError as error:
+                self.send_error(404, str(error))
+                return
+            return self.write_json({"kind": "overwritten", "snapshotId": snapshot_id, "frozen_at": frozen_at, "path": rel_path, "parsed": parsed})
+        else:
+            pending_id = enqueue_pending(url, title, png_bytes)
+            return self.write_json({"kind": "pending", "pendingId": pending_id})
+
+    def handle_snapshot_promote(self):
+        payload = self.read_json()
+        rel_path = payload.get("path")
+        pending_id = payload.get("pendingId")
+        heading_title = payload.get("headingTitle")
+        if not rel_path or not pending_id:
+            self.send_error(400, "Missing path or pendingId.")
+            return
+        self.resolve_project_path(rel_path)
+        try:
+            rel_path, text, parsed = promote_pending_snapshot(
+                self.server.project_root, rel_path, pending_id, heading_title
+            )
+        except ValueError as error:
+            self.send_error(404, str(error))
+            return
+        return self.write_json({"path": rel_path, "text": text, "parsed": parsed})
+
+    def handle_snapshot_discard(self):
+        payload = self.read_json()
+        pending_id = payload.get("pendingId")
+        if not pending_id:
+            self.send_error(400, "Missing pendingId.")
+            return
+        discard_pending(pending_id)
+        return self.write_json({"ok": True})
+
+    def handle_register_extension(self):
+        payload = self.read_json()
+        extension_id = payload.get("extensionId", "").strip()
+        if not extension_id:
+            self.send_error(400, "Missing extensionId.")
+            return
+        register_extension(extension_id)
+        return self.write_json({"ok": True})
 
     def serve_static(self, request_path):
         rel_path = "index.html" if request_path in ("", "/") else unquote(request_path).lstrip("/")

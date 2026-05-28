@@ -160,6 +160,7 @@ Built-ins are rendered directly in the main frontend:
 - `gallery`
 - `form`
 - `pdf`
+- `webSnapshot`
 
 They consume data through `loadData(source)`, which checks:
 

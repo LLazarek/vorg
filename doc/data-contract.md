@@ -23,6 +23,7 @@ The sidecar owns:
 - workspace-local SQL source definitions
 - workspace-local custom component definitions
 - snapshot history
+- screenshot PNGs under `.orghtml/snapshots/<snapshot-id>.png`
 
 The current design intentionally does not store layout or visual links in per-heading Org properties.
 
@@ -103,6 +104,7 @@ Current built-in types:
 - `gallery`
 - `form`
 - `pdf`
+- `webSnapshot`
 - `custom`
 
 ## Inline Org Tables

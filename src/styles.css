@@ -1016,3 +1016,99 @@ textarea {
     min-width: min(320px, 100%);
   }
 }
+
+/* Web Snapshot component */
+.web-snapshot-open {
+  display: block;
+  width: 100%;
+  margin-bottom: 8px;
+  padding: 5px 10px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--fg);
+  font-size: 12px;
+  cursor: pointer;
+  text-align: center;
+}
+
+.web-snapshot-open:hover {
+  background: var(--surface-hover, var(--border));
+}
+
+.web-snapshot-url {
+  display: block;
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 100%;
+  font-size: 12px;
+  margin-bottom: 6px;
+}
+
+.web-snapshot-ts {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.web-snapshot-thumb {
+  width: 100%;
+  height: auto;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  display: block;
+  cursor: pointer;
+}
+
+.web-snapshot-missing {
+  padding: 12px;
+  background: var(--surface);
+  border: 1px dashed var(--border);
+  border-radius: 4px;
+  color: var(--muted);
+  font-size: 12px;
+  text-align: center;
+}
+
+/* Pending snapshots panel */
+.pending-snapshots {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 4px 0;
+}
+
+.pending-empty {
+  padding: 8px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.pending-snapshot-item {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+}
+
+.pending-snapshot-info strong {
+  font-size: 13px;
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pending-snapshot-actions {
+  display: flex;
+  gap: 6px;
+}
+
+.pending-snapshot-actions button {
+  font-size: 12px;
+  padding: 3px 8px;
+}
