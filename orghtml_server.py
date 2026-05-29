@@ -187,7 +187,7 @@ def is_org_table_line(raw):
     return raw.strip().startswith("|")
 
 
-def parse_org_table_lines(table_lines):
+def parse_org_table_lines(table_lines, grouped=False):
     rows = []
     separator_indexes = []
     for index, raw in enumerate(table_lines):
@@ -210,9 +210,51 @@ def parse_org_table_lines(table_lines):
 
     sample_row = body_rows[0]["cells"] if body_rows else (rows[0]["cells"] if rows else [])
     columns = header or [f"col{index + 1}" for index in range(len(sample_row))]
-    data_rows = []
-    for row in body_rows:
-        data_rows.append({column: row["cells"][index] if index < len(row["cells"]) else "" for index, column in enumerate(columns)})
+
+    if grouped and len(separator_indexes) > 1:
+        # Build an ordered sequence of body rows and interior separators.
+        body_events = [(row["sourceIndex"], row) for row in body_rows]
+        for sep_idx in separator_indexes[1:]:
+            body_events.append((sep_idx, "sep"))
+        body_events.sort(key=lambda e: e[0])
+
+        # Split into groups at each interior separator.
+        groups = []
+        current_group = []
+        for _, event in body_events:
+            if event == "sep":
+                if current_group:
+                    groups.append(current_group)
+                current_group = []
+            else:
+                current_group.append(event)
+        if current_group:
+            groups.append(current_group)
+
+        # Fill-down within each group: first column is always the first row's
+        # value for the entire group; other columns fill empty cells from above.
+        data_rows = []
+        for group in groups:
+            if not group:
+                continue
+            group_key = group[0]["cells"][0] if group[0]["cells"] else ""
+            prev_cells = {col: "" for col in columns}
+            for row in group:
+                cells = row["cells"]
+                record = {}
+                for col_idx, column in enumerate(columns):
+                    raw_val = cells[col_idx] if col_idx < len(cells) else ""
+                    if col_idx == 0:
+                        record[column] = group_key
+                    else:
+                        record[column] = raw_val if raw_val else prev_cells[column]
+                prev_cells = record
+                data_rows.append(record)
+    else:
+        data_rows = [
+            {column: row["cells"][index] if index < len(row["cells"]) else "" for index, column in enumerate(columns)}
+            for row in body_rows
+        ]
 
     return {
         "raw": "\n".join(table_lines),
@@ -448,7 +490,8 @@ def parse_block_content(lines, start_line, end_line, drawer, heading_id):
             while line_index < end_line and is_org_table_line(line_body(lines[line_index])):
                 table_lines.append(line_body(lines[line_index]))
                 line_index += 1
-            table = parse_org_table_lines(table_lines)
+            grouped = bool(pending_view and pending_view.get("attrs", {}).get("grouped"))
+            table = parse_org_table_lines(table_lines, grouped=grouped)
             item = {"kind": "orgTable", "name": pending_name, "view": pending_view, **table}
             content.append(item)
             if pending_name:
