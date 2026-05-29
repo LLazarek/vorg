@@ -697,9 +697,14 @@ def update_block_text(text, block_id, text_index, body):
 def block_end_line(headings, index, lines):
     end = headings[index + 1]["headingLine"] if index + 1 < len(headings) else len(lines)
     j = index + 1
-    while j < len(headings) and headings[j]["level"] > headings[index]["level"] and "merge" in headings[j]["tags"]:
-        end = headings[j + 1]["headingLine"] if j + 1 < len(headings) else len(lines)
-        j += 1
+    if "mergeall" in headings[index]["tags"]:
+        while j < len(headings) and headings[j]["level"] > headings[index]["level"]:
+            end = headings[j + 1]["headingLine"] if j + 1 < len(headings) else len(lines)
+            j += 1
+    else:
+        while j < len(headings) and headings[j]["level"] > headings[index]["level"] and "merge" in headings[j]["tags"]:
+            end = headings[j + 1]["headingLine"] if j + 1 < len(headings) else len(lines)
+            j += 1
     return end
 
 
@@ -737,10 +742,16 @@ def ensure_heading_ids(text):
     changed = False
 
     novizall_level = None
+    mergeall_level = None
     for heading in headings:
         if novizall_level is not None and heading["level"] <= novizall_level:
             novizall_level = None
-        if novizall_level is not None or "noviz" in heading["tags"] or "novizall" in heading["tags"] or "merge" in heading["tags"]:
+        if mergeall_level is not None and heading["level"] <= mergeall_level:
+            mergeall_level = None
+        is_mergeall_child = mergeall_level is not None
+        if "mergeall" in heading["tags"]:
+            mergeall_level = heading["level"]
+        if is_mergeall_child or novizall_level is not None or "noviz" in heading["tags"] or "novizall" in heading["tags"] or "merge" in heading["tags"]:
             if "novizall" in heading["tags"]:
                 novizall_level = heading["level"]
             continue
@@ -806,11 +817,18 @@ def parse_org_document(text, workspace_doc=None, project_root=None):
     nodes = workspace_doc.get("nodes", {})
     previous_block_id = None
     novizall_level = None
+    mergeall_level = None
     for index, heading in enumerate(headings):
         heading_id = heading["id"]
 
         if novizall_level is not None and heading["level"] <= novizall_level:
             novizall_level = None
+        if mergeall_level is not None and heading["level"] <= mergeall_level:
+            mergeall_level = None
+        is_mergeall_child = mergeall_level is not None
+        if "mergeall" in heading["tags"]:
+            mergeall_level = heading["level"]
+
         suppressed = novizall_level is not None or "noviz" in heading["tags"] or "novizall" in heading["tags"]
         if "novizall" in heading["tags"]:
             novizall_level = heading["level"]
@@ -827,7 +845,7 @@ def parse_org_document(text, workspace_doc=None, project_root=None):
             named_queries.update(block_named_queries)
             continue
 
-        if "merge" in heading["tags"]:
+        if "merge" in heading["tags"] or is_mergeall_child:
             continue
 
         if not heading_id:
