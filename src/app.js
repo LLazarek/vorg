@@ -26,6 +26,11 @@ const elements = {
   inspectorStatus: document.getElementById("inspector-status"),
   componentInspector: document.getElementById("component-inspector"),
   refreshMetadata: document.getElementById("refresh-metadata"),
+  scanSettings: document.getElementById("scan-settings"),
+  scanSettingsDialog: document.getElementById("scan-settings-dialog"),
+  scanDirsList: document.getElementById("scan-dirs-list"),
+  scanSettingsSave: document.getElementById("scan-settings-save"),
+  scanSettingsCancel: document.getElementById("scan-settings-cancel"),
   projectPalette: document.getElementById("project-palette"),
   diagnostics: document.getElementById("diagnostics"),
   historyList: document.getElementById("history-list"),
@@ -60,7 +65,8 @@ const state = {
   sourceDirty: false,
   sourceCollapsed: false,
   inspectorCollapsed: false,
-  extensionConnected: false
+  extensionConnected: false,
+  scanConfig: { dirs: [{ path: ".", recursive: false }] }
 };
 const dataCache = new Map();
 const bodySaveTimers = new Map();
@@ -114,6 +120,9 @@ async function apiPost(path, payload) {
 
 async function refreshFiles() {
   const result = await apiGet("/api/files");
+  if (result.scanConfig) {
+    state.scanConfig = result.scanConfig;
+  }
   elements.fileSelect.replaceChildren();
 
   result.files.forEach((path) => {
@@ -268,6 +277,71 @@ async function applyRecipe() {
   setStatus(elements.sourceStatus, `Applied recipe to ${result.path}`, "ok");
 }
 
+async function openScanSettings() {
+  const result = await apiGet("/api/scan-dirs");
+  const subdirs = result.dirs;
+  const scanConfig = result.scanConfig || state.scanConfig;
+  const configByPath = {};
+  (scanConfig.dirs || []).forEach((entry) => { configByPath[entry.path] = entry; });
+
+  elements.scanDirsList.replaceChildren();
+
+  [".", ...subdirs].forEach((dirPath) => {
+    const entry = configByPath[dirPath];
+    const included = !!entry;
+    const recursive = entry?.recursive || false;
+
+    const row = document.createElement("div");
+    row.className = "scan-dir-row";
+
+    const includeCheck = document.createElement("input");
+    includeCheck.type = "checkbox";
+    includeCheck.id = `scan-dir-${CSS.escape(dirPath)}`;
+    includeCheck.dataset.path = dirPath;
+    includeCheck.checked = included;
+
+    const includeLabel = document.createElement("label");
+    includeLabel.htmlFor = includeCheck.id;
+    includeLabel.textContent = dirPath === "." ? "Root directory (.)" : dirPath;
+    includeLabel.className = "scan-dir-label";
+
+    const recursiveLabel = document.createElement("label");
+    recursiveLabel.className = "scan-recursive-label";
+    const recursiveCheck = document.createElement("input");
+    recursiveCheck.type = "checkbox";
+    recursiveCheck.checked = recursive;
+    recursiveCheck.disabled = !included;
+    recursiveLabel.append(recursiveCheck, " recursive");
+
+    includeCheck.addEventListener("change", () => {
+      recursiveCheck.disabled = !includeCheck.checked;
+      if (!includeCheck.checked) recursiveCheck.checked = false;
+    });
+
+    row.append(includeCheck, includeLabel, recursiveLabel);
+    elements.scanDirsList.append(row);
+  });
+
+  elements.scanSettingsDialog.showModal();
+}
+
+async function saveScanSettings() {
+  const dirs = [];
+  elements.scanDirsList.querySelectorAll(".scan-dir-row").forEach((row) => {
+    const includeCheck = row.querySelector("input[type='checkbox'][data-path]");
+    const recursiveCheck = row.querySelector(".scan-recursive-label input");
+    if (includeCheck.checked) {
+      dirs.push({ path: includeCheck.dataset.path, recursive: recursiveCheck.checked });
+    }
+  });
+  const result = await apiPost("/api/save-scan-config", { dirs });
+  state.scanConfig = result.scan;
+  elements.scanSettingsDialog.close();
+  await refreshFiles();
+  await refreshMetadata();
+  setStatus(elements.sourceStatus, "Scan settings saved.", "ok");
+}
+
 function render() {
   renderDiagnostics(collectDiagnostics());
   renderNodes();
@@ -319,7 +393,10 @@ function renderProjectPalette() {
   if (!state.metadata.tables.length && !state.metadata.imageDirs.length) {
     const empty = document.createElement("div");
     empty.className = "empty-state";
-    empty.textContent = "No CSV, JSONL, or image folders found.";
+    empty.innerHTML = `No data files found in scanned directories. <button type="button" class="inline-link-button">Scan settings…</button>`;
+    empty.querySelector("button").addEventListener("click", () => {
+      openScanSettings().catch((error) => setStatus(elements.sourceStatus, error.message, "error"));
+    });
     elements.projectPalette.append(empty);
     return;
   }
@@ -2572,6 +2649,16 @@ elements.applyRecipe.addEventListener("click", () => {
 
 elements.saveFile.addEventListener("click", () => {
   saveWorkspace().catch((error) => setStatus(elements.sourceStatus, error.message, "error"));
+});
+
+elements.scanSettings.addEventListener("click", () => {
+  openScanSettings().catch((error) => setStatus(elements.sourceStatus, error.message, "error"));
+});
+elements.scanSettingsSave.addEventListener("click", () => {
+  saveScanSettings().catch((error) => setStatus(elements.sourceStatus, error.message, "error"));
+});
+elements.scanSettingsCancel.addEventListener("click", () => {
+  elements.scanSettingsDialog.close();
 });
 
 elements.createLink.addEventListener("click", startLink);

@@ -291,6 +291,68 @@ def pdf_path_from_org_link(raw):
     return {"path": path, "title": display or Path(path).name, "raw": raw.strip()}
 
 
+DEFAULT_SCAN_DIRS = [{"path": ".", "recursive": False}]
+
+
+def scan_include_dirs(root, workspace):
+    """Parse workspace scan config into (resolved_path, recursive) tuples."""
+    entries = (workspace.get("scan") or {}).get("dirs") or DEFAULT_SCAN_DIRS
+    root_resolved = root.resolve()
+    result = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        rel = str(entry.get("path") or ".").replace("\\", "/").strip()
+        recursive = bool(entry.get("recursive", False))
+        try:
+            candidate = (root_resolved / rel).resolve()
+            if candidate != root_resolved and root_resolved not in candidate.parents:
+                continue
+            if candidate.is_dir():
+                result.append((candidate, recursive))
+        except (OSError, ValueError):
+            continue
+    return result if result else [(root_resolved, False)]
+
+
+def iter_scan_files(root, include_dirs, extensions):
+    """Yield (path, rel_path) for files matching extensions within the scan scope."""
+    seen = set()
+    ext_set = {e.lower() for e in extensions}
+    root_resolved = root.resolve()
+    for directory, recursive in include_dirs:
+        try:
+            iterator = directory.rglob("*") if recursive else directory.iterdir()
+        except OSError:
+            continue
+        for path in sorted(iterator):
+            if not path.is_file() or ".orghtml" in path.parts:
+                continue
+            if path.suffix.lower() not in ext_set:
+                continue
+            resolved = path.resolve()
+            if resolved in seen:
+                continue
+            seen.add(resolved)
+            try:
+                rel_path = str(resolved.relative_to(root_resolved))
+            except ValueError:
+                continue
+            yield path, rel_path
+
+
+def list_scan_dirs(root):
+    """List direct non-hidden subdirectories of root for the scan settings UI."""
+    result = []
+    try:
+        for entry in sorted(root.iterdir()):
+            if entry.is_dir() and not entry.name.startswith(".") and entry.name != "__pycache__":
+                result.append(entry.name)
+    except OSError:
+        pass
+    return result
+
+
 def sql_identifier(name):
     return '"' + str(name).replace('"', '""') + '"'
 
@@ -304,6 +366,12 @@ def sql_table_name_for_path(rel_path):
     return f"file_{stem}"
 
 
+def _to_sqlite_scalar(value):
+    if value is None or isinstance(value, (str, int, float, bytes)):
+        return value
+    return json.dumps(value)
+
+
 def import_table_into_sqlite(connection, table_name, columns, rows):
     if not columns:
         return
@@ -313,7 +381,7 @@ def import_table_into_sqlite(connection, table_name, columns, rows):
     connection.execute(f"CREATE TABLE {quoted_table} ({quoted_columns})")
     placeholders = ", ".join("?" for _ in columns)
     insert_sql = f"INSERT INTO {quoted_table} ({', '.join(sql_identifier(column) for column in columns)}) VALUES ({placeholders})"
-    connection.executemany(insert_sql, [[row.get(column, "") for column in columns] for row in rows])
+    connection.executemany(insert_sql, [[_to_sqlite_scalar(row.get(column, "")) for column in columns] for row in rows])
 
 
 def query_sqlite(connection, sql):
@@ -323,29 +391,33 @@ def query_sqlite(connection, sql):
     return {"columns": columns, "rows": rows}
 
 
-def populate_workspace_sqlite(connection, root, named_tables, named_queries):
+def populate_workspace_sqlite(connection, root, named_tables, named_queries, include_dirs=None):
     diagnostics = []
     external_mappings = []
-    for path in sorted(root.rglob("*")):
-        if ".orghtml" in path.parts or not path.is_file():
-            continue
-        if path.suffix.lower() not in (".csv", ".jsonl"):
-            continue
-        rel_path = str(path.relative_to(root))
+    if include_dirs is None:
+        include_dirs = [(root.resolve(), False)]
+    for path, rel_path in iter_scan_files(root, include_dirs, {".csv", ".jsonl"}):
         table_name = sql_table_name_for_path(rel_path)
         try:
             table = read_table(path)
         except (OSError, json.JSONDecodeError, csv.Error) as error:
             diagnostics.append(f"Failed to import {rel_path} into SQL: {error}")
             continue
-        import_table_into_sqlite(connection, table_name, table["columns"], table["rows"])
+        try:
+            import_table_into_sqlite(connection, table_name, table["columns"], table["rows"])
+        except sqlite3.OperationalError as error:
+            diagnostics.append(f"Failed to import {rel_path} into SQL: {error}")
+            continue
         external_mappings.append({"path": rel_path, "table": table_name})
 
     if external_mappings:
         import_table_into_sqlite(connection, "orghtml_sources", ["path", "table"], external_mappings)
 
     for name, table in named_tables.items():
-        import_table_into_sqlite(connection, name, table["columns"], table["rows"])
+        try:
+            import_table_into_sqlite(connection, name, table["columns"], table["rows"])
+        except sqlite3.OperationalError as error:
+            diagnostics.append(f"Failed to import named table {name!r} into SQL: {error}")
 
     sources = {name: {"columns": table["columns"], "rows": table["rows"]} for name, table in named_tables.items()}
     pending = dict(named_queries)
@@ -370,10 +442,10 @@ def populate_workspace_sqlite(connection, root, named_tables, named_queries):
     return sources, diagnostics
 
 
-def build_named_sources(root, named_tables, named_queries):
+def build_named_sources(root, named_tables, named_queries, include_dirs=None):
     connection = sqlite3.connect(":memory:")
     try:
-        return populate_workspace_sqlite(connection, root, named_tables, named_queries)
+        return populate_workspace_sqlite(connection, root, named_tables, named_queries, include_dirs)
     finally:
         connection.close()
 
@@ -399,7 +471,7 @@ def collect_workspace_named_data(text, workspace_doc=None):
     return named_tables, named_queries
 
 
-def execute_workspace_query(root, text, workspace_doc, sql):
+def execute_workspace_query(root, text, workspace_doc, sql, include_dirs=None):
     statement = str(sql or "").strip()
     if not statement:
         raise ValueError("Missing SQL query.")
@@ -407,9 +479,11 @@ def execute_workspace_query(root, text, workspace_doc, sql):
         raise ValueError("Only read-only SELECT queries are allowed.")
 
     named_tables, named_queries = collect_workspace_named_data(text, workspace_doc)
+    if include_dirs is None:
+        include_dirs = scan_include_dirs(root, read_workspace(root))
     connection = sqlite3.connect(":memory:")
     try:
-        _, diagnostics = populate_workspace_sqlite(connection, root, named_tables, named_queries)
+        _, diagnostics = populate_workspace_sqlite(connection, root, named_tables, named_queries, include_dirs)
         result = query_sqlite(connection, statement)
     except sqlite3.Error as error:
         raise ValueError(str(error)) from error
@@ -777,8 +851,10 @@ def ensure_heading_ids(text):
     return "".join(lines), changed
 
 
-def parse_org_document(text, workspace_doc=None, project_root=None):
+def parse_org_document(text, workspace_doc=None, project_root=None, include_dirs=None):
     workspace_doc = workspace_doc or {}
+    if include_dirs is None and project_root:
+        include_dirs = scan_include_dirs(project_root, read_workspace(project_root))
     lines, headings = find_headings(text)
     diagnostics = []
 
@@ -920,7 +996,7 @@ def parse_org_document(text, workspace_doc=None, project_root=None):
         if source in block_ids and target in block_ids:
             links.append({"id": f"e-{source}-{target}", "sourceId": source, "targetId": target})
 
-    named_sources, source_diagnostics = build_named_sources(project_root or Path("."), named_tables, named_queries)
+    named_sources, source_diagnostics = build_named_sources(project_root or Path("."), named_tables, named_queries, include_dirs)
     return {
         "blocks": public_blocks,
         "links": links,
@@ -1287,35 +1363,47 @@ def image_files(root, rel_path):
     return images
 
 
-def scan_project_metadata(root):
-    tables = []
-    image_dirs = []
-    for path in sorted(root.rglob("*")):
-        if ".orghtml" in path.parts or not path.is_file():
-            continue
-        rel_path = str(path.relative_to(root))
-        suffix = path.suffix.lower()
-        if suffix in (".csv", ".jsonl"):
-            try:
-                table = read_table(path)
-            except (OSError, json.JSONDecodeError, csv.Error):
-                continue
-            tables.append({
-                "path": rel_path,
-                "columns": table["columns"],
-                "rows": len(table["rows"]),
-                "kind": suffix.lstrip("."),
-            })
+def scan_project_metadata(root, include_dirs=None):
+    if include_dirs is None:
+        include_dirs = scan_include_dirs(root, read_workspace(root))
+    root_resolved = root.resolve()
 
-    for directory in sorted({path.parent for path in root.rglob("*") if path.is_file()}):
-        if ".orghtml" in directory.parts:
+    tables = []
+    for path, rel_path in iter_scan_files(root, include_dirs, {".csv", ".jsonl"}):
+        try:
+            table = read_table(path)
+        except (OSError, json.JSONDecodeError, csv.Error):
             continue
-        images = image_files(root, str(directory.relative_to(root)))
-        if images:
-            image_dirs.append({
-                "path": str(directory.relative_to(root)) or ".",
-                "images": len(images),
-            })
+        tables.append({
+            "path": rel_path,
+            "columns": table["columns"],
+            "rows": len(table["rows"]),
+            "kind": path.suffix.lower().lstrip("."),
+        })
+
+    image_dirs = []
+    checked_dirs = set()
+    for directory, recursive in include_dirs:
+        candidates = [directory]
+        if recursive:
+            try:
+                candidates.extend(
+                    sub for sub in sorted(directory.rglob("*"))
+                    if sub.is_dir() and ".orghtml" not in sub.parts
+                )
+            except OSError:
+                pass
+        for d in candidates:
+            if d in checked_dirs or ".orghtml" in d.parts:
+                continue
+            checked_dirs.add(d)
+            try:
+                rel = str(d.relative_to(root_resolved))
+            except ValueError:
+                continue
+            images = image_files(root, rel)
+            if images:
+                image_dirs.append({"path": rel or ".", "images": len(images)})
 
     return {"tables": tables, "imageDirs": image_dirs}
 
@@ -1544,6 +1632,8 @@ class OrgHtmlHandler(BaseHTTPRequestHandler):
             return self.handle_snapshot_pending()
         if parsed.path == "/api/snapshot/extension-info":
             return self.write_json(get_extension_info())
+        if parsed.path == "/api/scan-dirs":
+            return self.handle_scan_dirs()
         if parsed.path == "/asset":
             return self.handle_asset(parsed.query)
         return self.serve_static(parsed.path)
@@ -1580,15 +1670,19 @@ class OrgHtmlHandler(BaseHTTPRequestHandler):
             return self.handle_snapshot_discard()
         if parsed.path == "/api/snapshot/register-extension":
             return self.handle_register_extension()
+        if parsed.path == "/api/save-scan-config":
+            return self.handle_save_scan_config()
         self.send_error(404)
 
     def handle_files(self):
         root = self.server.project_root
-        files = []
-        for path in sorted(root.rglob("*.org")):
-            if ".orghtml" not in path.parts and path.is_file():
-                files.append(str(path.relative_to(root)))
-        return self.write_json({"root": str(root), "files": files, "workspace": WORKSPACE_PATH})
+        workspace = read_workspace(root)
+        include_dirs = scan_include_dirs(root, workspace)
+        files = sorted(rel_path for _, rel_path in iter_scan_files(root, include_dirs, {".org"}))
+        scan_config = workspace.get("scan") or {"dirs": DEFAULT_SCAN_DIRS}
+        if not scan_config.get("dirs"):
+            scan_config = {"dirs": DEFAULT_SCAN_DIRS}
+        return self.write_json({"root": str(root), "files": files, "workspace": WORKSPACE_PATH, "scanConfig": scan_config})
 
     def handle_document(self, query):
         params = parse_qs(query)
@@ -1969,6 +2063,43 @@ class OrgHtmlHandler(BaseHTTPRequestHandler):
             return
         register_extension(extension_id)
         return self.write_json({"ok": True})
+
+    def handle_scan_dirs(self):
+        root = self.server.project_root
+        workspace = read_workspace(root)
+        scan_config = workspace.get("scan") or {}
+        if not scan_config.get("dirs"):
+            scan_config = {"dirs": DEFAULT_SCAN_DIRS}
+        return self.write_json({"dirs": list_scan_dirs(root), "scanConfig": scan_config})
+
+    def handle_save_scan_config(self):
+        payload = self.read_json()
+        dirs = payload.get("dirs")
+        if not isinstance(dirs, list):
+            self.send_error(400, "dirs must be a list.")
+            return
+        root = self.server.project_root.resolve()
+        validated = []
+        for entry in dirs:
+            if not isinstance(entry, dict):
+                continue
+            path_str = str(entry.get("path") or ".").strip()
+            recursive = bool(entry.get("recursive", False))
+            try:
+                candidate = (root / path_str).resolve()
+                if candidate != root and root not in candidate.parents:
+                    continue
+                if not candidate.is_dir():
+                    continue
+            except (OSError, ValueError):
+                continue
+            validated.append({"path": path_str, "recursive": recursive})
+        if not validated:
+            validated = list(DEFAULT_SCAN_DIRS)
+        workspace = read_workspace(self.server.project_root)
+        workspace["scan"] = {"dirs": validated}
+        write_workspace(self.server.project_root, workspace)
+        return self.write_json({"ok": True, "scan": workspace["scan"]})
 
     def serve_static(self, request_path):
         rel_path = "index.html" if request_path in ("", "/") else unquote(request_path).lstrip("/")
