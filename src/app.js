@@ -63,13 +63,14 @@ const state = {
   sqlSources: {},
   history: [],
   sourceDirty: false,
-  sourceCollapsed: false,
-  inspectorCollapsed: false,
+  sourceCollapsed: true,
+  inspectorCollapsed: true,
   extensionConnected: false,
   scanConfig: { dirs: [{ path: ".", recursive: false }] }
 };
 const dataCache = new Map();
 const bodySaveTimers = new Map();
+let _sidecarSaveTimer = null;
 const blockResizeObserver = new ResizeObserver(() => {
   applyFlowLayout();
   drawEdges();
@@ -246,6 +247,18 @@ async function saveWorkspace() {
   setStatus(elements.sourceStatus, `Saved .orghtml/workspace.json`, "ok");
   setStatus(elements.workspaceStatus, `${state.blocks.length} blocks`, "ok");
   await refreshHistory();
+}
+
+function scheduleSidecarSave(delay = 800) {
+  if (_sidecarSaveTimer) {
+    clearTimeout(_sidecarSaveTimer);
+  }
+  _sidecarSaveTimer = setTimeout(() => {
+    _sidecarSaveTimer = null;
+    if (state.dirty && state.path) {
+      saveWorkspace().catch((error) => setStatus(elements.sourceStatus, error.message, "error"));
+    }
+  }, delay);
 }
 
 async function generateWorkspace() {
@@ -2243,6 +2256,9 @@ function handlePointerUp(event) {
     state.pan = null;
     render();
   }
+  if (state.dirty) {
+    scheduleSidecarSave();
+  }
 }
 
 function handleResizePointerDown(event) {
@@ -2395,6 +2411,7 @@ function handleWheel(event) {
   state.dirty = true;
   syncCamera();
   drawEdges();
+  scheduleSidecarSave();
 }
 
 function startLink() {
@@ -2417,12 +2434,13 @@ function toggleLink(targetId) {
   const existingIndex = state.links.findIndex((link) => link.sourceId === sourceId && link.targetId === targetId);
   if (existingIndex >= 0) {
     state.links.splice(existingIndex, 1);
-    setStatus(elements.workspaceStatus, "Link removed - unsaved sidecar", "muted");
+    setStatus(elements.workspaceStatus, "Link removed", "muted");
   } else {
     state.links.push({ id: `draft-${sourceId}-${targetId}`, sourceId, targetId });
-    setStatus(elements.workspaceStatus, "Link added - unsaved sidecar", "muted");
+    setStatus(elements.workspaceStatus, "Link added", "muted");
   }
   state.dirty = true;
+  scheduleSidecarSave();
   render();
 }
 
@@ -2441,6 +2459,7 @@ function deleteSelectedLinks() {
   });
   if (state.links.length !== before) {
     state.dirty = true;
+    scheduleSidecarSave();
     render();
   }
 }
